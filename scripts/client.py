@@ -13,33 +13,15 @@ TCP 文件传输客户端
 import socket
 import os
 import sys
-import select
-import time
-import threading
-
-# Windows 虚拟终端支持
-if sys.platform == 'win32':
-    def _enable_virtual_terminal():
-        """启用Windows虚拟终端支持（用于ANSI转义序列）"""
-        try:
-            import ctypes
-            STD_OUTPUT_HANDLE = -11
-            hConsole = ctypes.windll.kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-            mode = ctypes.wintypes.DWORD()
-            ctypes.windll.kernel32.GetConsoleMode(hConsole, ctypes.byref(mode))
-            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-            mode.value |= ENABLE_VIRTUAL_TERMINAL_PROCESSING
-            ctypes.windll.kernel32.SetConsoleMode(hConsole, mode)
-        except Exception:
-            pass
-    _enable_virtual_terminal()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.network import FrameHandler
 from src.business import ClientHandler
 from src.common import ConfigManager, ConfigUI
-from src.utils.logger import configure_logging, get_logger
+from src.common.connection_manager import ConnectionManager
+from src.common.ui_utils import get_input_with_connection_check
+from src.utils.logger import configure_logging
 from src.utils.file_utils import (
     ensure_directory, SMALL_FILE_THRESHOLD, 
     is_filename_length_valid, get_max_filename_length, 
@@ -48,247 +30,13 @@ from src.utils.file_utils import (
 from src.utils.progress_bar import ProgressBar
 
 
-def is_socket_connected(client_socket):
-    """检查socket连接是否仍然有效"""
-    try:
-        error_code = client_socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-        return error_code == 0
-    except Exception:
-        return False
-
-
-def check_server_shutdown(client_socket, frame_handler):
-    """检查服务器是否发送了关闭通知或连接是否已断开"""
-    global is_transferring
-    
-    # 如果正在传输文件，跳过检查以避免干扰
-    if is_transferring:
-        return False
-        
-    try:
-        client_socket.setblocking(False)
-        try:
-            read_list, _, _ = select.select([client_socket], [], [], 0.01)
-            if read_list:
-                try:
-                    frame_type, data = frame_handler.receive_frame(client_socket)
-                    if frame_type is not None:
-                        if isinstance(data, dict) and data.get("type") == "server_shutdown":
-                            message = data.get("message", "服务器即将关闭")
-                            print('服务器通知: {0}'.format(message))
-                            return True
-                    else:
-                        print("\n检测到服务器连接已断开")
-                        return True
-                except (ConnectionResetError, BrokenPipeError, OSError):
-                    print("\n检测到服务器连接已断开")
-                    return True
-                except Exception:
-                    print("\n检测到连接异常")
-                    return True
-        finally:
-            client_socket.setblocking(True)
-    except Exception:
-        pass
-    return False
-
-
-def get_windows_input_non_blocking(hConsoleInput):
-    """非阻塞方式读取单个按键输入（Windows专用）"""
-    import ctypes
-    import ctypes.wintypes
-    
-    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    
-    class KEY_EVENT_RECORD(ctypes.Structure):
-        _fields_ = [
-            ("bKeyDown", ctypes.wintypes.BOOL),
-            ("wRepeatCount", ctypes.wintypes.WORD),
-            ("wVirtualKeyCode", ctypes.wintypes.WORD),
-            ("wVirtualScanCode", ctypes.wintypes.WORD),
-            ("uChar", ctypes.wintypes.WCHAR),
-            ("dwControlKeyState", ctypes.wintypes.DWORD)
-        ]
-    
-    class INPUT_RECORD(ctypes.Structure):
-        _fields_ = [
-            ("EventType", ctypes.wintypes.WORD),
-            ("KeyEvent", KEY_EVENT_RECORD)
-        ]
-    
-    KEY_EVENT = 0x0001
-    ir = INPUT_RECORD()
-    num_read = ctypes.wintypes.DWORD()
-    
-    success = kernel32.PeekConsoleInputW(hConsoleInput, ctypes.byref(ir), 1, ctypes.byref(num_read))
-    if not success or num_read.value == 0:
-        return None
-    
-    kernel32.ReadConsoleInputW(hConsoleInput, ctypes.byref(ir), 1, ctypes.byref(num_read))
-    
-    if ir.EventType == KEY_EVENT:
-        key_event = ir.KeyEvent
-        if key_event.bKeyDown:
-            if key_event.wVirtualKeyCode == 13:
-                return '\n'
-            elif key_event.wVirtualKeyCode == 8:
-                return '\b'
-            elif key_event.uChar != '\x00':
-                return key_event.uChar
-    return None
-
-
-def get_windows_input_with_check(prompt, client_socket, frame_handler):
-    """使用 Windows Unicode API 读取中文输入（带连接检查）"""
-    import ctypes
-    
-    global connection_lost
-    
-    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    STD_INPUT_HANDLE = -10
-    hConsoleInput = kernel32.GetStdHandle(STD_INPUT_HANDLE)
-    
-    if hConsoleInput == 0:
-        return input(prompt)
-    
-    buffer = []
-    print(prompt, end='', flush=True)
-    
-    while True:
-        if connection_lost:
-            print('\n心跳检测到连接已断开')
-            return None
-        
-        try:
-            error_code = client_socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-            if error_code != 0:
-                print('\n检测到socket错误，连接已断开')
-                return None
-        except Exception as e:
-            print('\n检查连接状态失败: {0}'.format(e))
-            return None
-        
-        char = get_windows_input_non_blocking(hConsoleInput)
-        
-        if char == '\n':
-            print()
-            return ''.join(buffer)
-        elif char == '\b':
-            if buffer:
-                buffer.pop()
-                sys.stdout.write('\b \b')
-                sys.stdout.flush()
-        elif char is not None:
-            buffer.append(char)
-            sys.stdout.write(char)
-            sys.stdout.flush()
-        
-        time.sleep(0.01)
-
-
-def get_input_with_server_check(client_socket, frame_handler, prompt):
-    """在等待用户输入时检测服务器关闭通知"""
-    if sys.platform == 'win32':
-        return get_windows_input_with_check(prompt, client_socket, frame_handler)
-    else:
-        print(prompt, end='', flush=True)
-        buffer = []
-        
-        while True:
-            if check_server_shutdown(client_socket, frame_handler):
-                print()
-                return None
-            
-            if not is_socket_connected(client_socket):
-                print('\n检测到与服务器的连接已断开')
-                return None
-            
-            read_list, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if read_list:
-                line = sys.stdin.readline()
-                return line.strip()
-            
-            time.sleep(0.05)
-
-
-# 全局连接状态
-connection_lost = False
-is_transferring = False
-heartbeat_thread = None
-heartbeat_stop_event = None
-
-
-def heartbeat_monitor(client_socket, frame_handler):
-    """心跳监控线程"""
-    global connection_lost, is_transferring
-    heartbeat_interval = 3
-    max_timeouts = 2
-    timeout_count = 0
-    
-    while not heartbeat_stop_event.is_set():
-        if is_transferring:
-            time.sleep(0.5)
-            continue
-            
-        try:
-            heartbeat_request = {"action": "heartbeat", "timestamp": int(time.time())}
-            frame_handler.send_json_frame(client_socket, heartbeat_request)
-            
-            frame_type, response = frame_handler.receive_frame(client_socket, timeout=5)
-            
-            if response is None or response.get("status") != "success":
-                timeout_count += 1
-                if timeout_count >= max_timeouts:
-                    print("\n连接超时，心跳检测失败")
-                    connection_lost = True
-                    break
-            else:
-                timeout_count = 0
-                
-        except socket.timeout:
-            timeout_count += 1
-            if timeout_count >= max_timeouts:
-                print("\n心跳超时，连接可能已断开")
-                connection_lost = True
-                break
-        except Exception as e:
-            print(f"\n心跳检测异常: {e}")
-            connection_lost = True
-            break
-            
-        for _ in range(heartbeat_interval):
-            if heartbeat_stop_event.is_set():
-                break
-            time.sleep(1)
-
-
-def reconnect_with_backoff(config_manager, max_retries=5):
-    """带退避策略的重连"""
-    server_host = config_manager.get("server.host", "127.0.0.1")
-    server_port = config_manager.get("server.port", 2983)
-    
-    backoff = 1
-    for attempt in range(max_retries):
-        try:
-            print(f"\n尝试重新连接 ({attempt + 1}/{max_retries})...")
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.connect((server_host, server_port))
-            print("重连成功！")
-            return client_socket
-        except ConnectionRefusedError:
-            print(f"连接失败，等待 {backoff} 秒后重试...")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-    
-    print("重连失败，已达最大重试次数")
-    return None
-
-
-def upload_file(client_socket, frame_handler, client_handler):
+def upload_file(client_socket, frame_handler, client_handler, connection_manager):
     """上传文件到服务器"""
-    global is_transferring
-    
-    display_name = get_input_with_server_check(client_socket, frame_handler, "请输入文件名称: ")
+    display_name = get_input_with_connection_check(
+        "请输入文件显示名称: ", 
+        client_socket,
+        lambda: connection_manager.connection_lost
+    )
     if display_name is None:
         return None
     
@@ -306,7 +54,11 @@ def upload_file(client_socket, frame_handler, client_handler):
         print("不安全的文件名，不允许包含路径字符（如 ../ 或 \\）")
         return True
     
-    filepath = get_input_with_server_check(client_socket, frame_handler, "请输入文件路径: ")
+    filepath = get_input_with_connection_check(
+        "请输入文件路径: ",
+        client_socket,
+        lambda: connection_manager.connection_lost
+    )
     if filepath is None:
         return None
     
@@ -334,7 +86,7 @@ def upload_file(client_socket, frame_handler, client_handler):
         progress_bar.update(current)
     
     try:
-        is_transferring = True
+        connection_manager.is_transferring = True
         success = client_handler.upload_file_with_name(client_socket, frame_handler, filepath, display_name, progress_callback)
         progress_bar.finish()
         print("文件上传成功" if success else "文件上传失败")
@@ -344,14 +96,16 @@ def upload_file(client_socket, frame_handler, client_handler):
         print("上传文件时发生错误: {0}".format(e))
         return None
     finally:
-        is_transferring = False
+        connection_manager.is_transferring = False
 
 
-def download_file(client_socket, frame_handler, client_handler):
+def download_file(client_socket, frame_handler, client_handler, connection_manager):
     """从服务器下载文件"""
-    global is_transferring
-    
-    filename = get_input_with_server_check(client_socket, frame_handler, "请输入要下载的文件名: ")
+    filename = get_input_with_connection_check(
+        "请输入要下载的文件名: ",
+        client_socket,
+        lambda: connection_manager.connection_lost
+    )
     if filename is None:
         return None
     
@@ -368,8 +122,7 @@ def download_file(client_socket, frame_handler, client_handler):
     progress_bar = None
     
     try:
-        # 提前设置 is_transferring，防止心跳线程干扰
-        is_transferring = True
+        connection_manager.is_transferring = True
         
         request = client_handler.prepare_download_request(filename, resume_from)
         frame_handler.send_json_frame(client_socket, request)
@@ -409,7 +162,7 @@ def download_file(client_socket, frame_handler, client_handler):
         print("下载文件时发生错误: {0}".format(e))
         return None
     finally:
-        is_transferring = False
+        connection_manager.is_transferring = False
 
 
 def list_files(client_socket, frame_handler, client_handler):
@@ -446,15 +199,15 @@ def connect_to_server(config_manager):
     server_host = config_manager.get("server.host")
     server_port = config_manager.get("server.port")
     
-    print("连接到 {0}:{1}...".format(server_host, server_port))
+    print("连接到 {0}:{1}...".format(server_host, server_port), flush=True)
     
     try:
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client_socket.connect((server_host, server_port))
-        print("连接成功")
+        print("连接成功", flush=True)
         return client_socket
     except Exception as e:
-        print("连接失败: {0}".format(e))
+        print("连接失败: {0}".format(e), flush=True)
         return None
 
 
@@ -471,12 +224,12 @@ def show_menu():
     print("=" * 60)
 
 
-def handle_menu_choice(choice, client_socket, frame_handler, client_handler):
+def handle_menu_choice(choice, client_socket, frame_handler, client_handler, connection_manager):
     """处理菜单选择"""
     if choice == '1':
-        return upload_file(client_socket, frame_handler, client_handler)
+        return upload_file(client_socket, frame_handler, client_handler, connection_manager)
     elif choice == '2':
-        return download_file(client_socket, frame_handler, client_handler)
+        return download_file(client_socket, frame_handler, client_handler, connection_manager)
     elif choice == '3':
         return list_files(client_socket, frame_handler, client_handler)
     elif choice == '4':
@@ -488,12 +241,19 @@ def handle_menu_choice(choice, client_socket, frame_handler, client_handler):
         return True
 
 
+def print_current_config(config_manager):
+    """打印当前配置"""
+    print("\n当前配置:")
+    print("-" * 40)
+    print("服务器地址: {0}".format(config_manager.get("server.host", "未设置")))
+    print("服务器端口: {0}".format(config_manager.get("server.port", "未设置")))
+    print("下载目录: {0}".format(config_manager.get("client.download_dir", "未设置")))
+    print("-" * 40)
+
+
 def main():
     """主函数"""
-    global connection_lost, heartbeat_thread, heartbeat_stop_event
-    
     configure_logging()
-    logger = get_logger(__name__)
     
     config_manager = ConfigManager("config/client_config.json")
     
@@ -502,7 +262,10 @@ def main():
         print("    TCP 文件传输客户端")
         print("=" * 60)
         
-        choice = input("是否修改配置? (y/n，默认n): ").strip().lower()
+        # 先打印当前配置
+        print_current_config(config_manager)
+        
+        choice = input("\n是否修改配置? (y/n，默认n): ").strip().lower()
         if choice == 'y':
             ConfigUI.edit_client_config(config_manager)
         
@@ -511,6 +274,7 @@ def main():
         
         client_handler = ClientHandler(download_dir=download_dir)
         frame_handler = FrameHandler()
+        connection_manager = ConnectionManager()
         
         client_socket = connect_to_server(config_manager)
         if not client_socket:
@@ -521,33 +285,19 @@ def main():
                 break
             continue
         
-        # 启动心跳监控线程
-        heartbeat_stop_event = threading.Event()
-        heartbeat_thread = threading.Thread(
-            target=heartbeat_monitor, 
-            args=(client_socket, frame_handler),
-            daemon=True
-        )
-        heartbeat_thread.start()
+        # 启动心跳监控
+        connection_manager.start_heartbeat(client_socket, frame_handler)
         
         connected = True
         result = None
         while connected:
-            if connection_lost:
+            if connection_manager.connection_lost:
                 print("\n检测到连接断开，尝试重新连接...")
                 client_socket.close()
-                client_socket = reconnect_with_backoff(config_manager)
+                client_socket = connection_manager.reconnect_with_backoff(config_manager)
                 
                 if client_socket:
-                    connection_lost = False
-                    heartbeat_stop_event.set()
-                    heartbeat_stop_event = threading.Event()
-                    heartbeat_thread = threading.Thread(
-                        target=heartbeat_monitor, 
-                        args=(client_socket, frame_handler),
-                        daemon=True
-                    )
-                    heartbeat_thread.start()
+                    connection_manager.start_heartbeat(client_socket, frame_handler)
                     print("重新连接成功，可以继续操作")
                 else:
                     print("无法重新连接")
@@ -555,40 +305,43 @@ def main():
                     break
             
             show_menu()
-            user_choice = get_input_with_server_check(client_socket, frame_handler, "\n请输入选择 (1-5): ")
+            user_choice = get_input_with_connection_check(
+                "\n请输入选择 (1-5): ",
+                client_socket,
+                lambda: connection_manager.connection_lost
+            )
             
             if user_choice is None:
                 print("连接已断开或服务器关闭")
                 connected = False
                 break
             
-            result = handle_menu_choice(user_choice, client_socket, frame_handler, client_handler)
+            result = handle_menu_choice(user_choice, client_socket, frame_handler, client_handler, connection_manager)
             
             if result is None:
-                print("连接已断开")
+                # print("连接已断开")
                 connected = False
                 break
             elif result == 'back':
                 connected = False
-                print("返回配置界面...")
+                # print("返回配置界面...")
             elif result == 'exit':
                 connected = False
-                print("退出客户端...")
         
-        if heartbeat_stop_event:
-            heartbeat_stop_event.set()
+        connection_manager.stop_heartbeat()
         
-        if connected == False and result != 'exit':
-            print("\n是否重新配置服务器地址并重新连接?")
-            retry_choice = input("输入 'y' 重新配置，其他键退出: ").strip().lower()
-            if retry_choice != 'y':
-                print("退出客户端...")
-                break
+        if result == 'exit':
+            print("退出客户端...")
+            break
         
         try:
             client_socket.close()
         except Exception:
             pass
+        
+        # 连接断开或返回配置界面，直接回到配置界面（主循环开头）
+        if connected == False:
+            print("\n连接已断开，返回配置界面...")
 
 
 if __name__ == "__main__":

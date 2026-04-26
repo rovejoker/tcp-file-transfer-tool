@@ -102,10 +102,23 @@ def main():
     print("    TCP 文件传输服务器")
     print("=" * 60)
     
-    choice = input("是否修改配置? (y/n，默认n): ").strip().lower()
+    # 先打印当前配置
+    server_port = config_manager.get("server.port", 2983)
+    resource_dir = config_manager.get("server.resource_dir", "resource")
+    max_file_size_mb = config_manager.get("server.max_file_size_mb", 1024)
+    
+    print("\n当前配置:")
+    print("-" * 40)
+    print("监听端口: {0}".format(server_port))
+    print("资源目录: {0}".format(resource_dir))
+    print("最大文件大小: {0} MB".format(max_file_size_mb))
+    print("-" * 40)
+    
+    choice = input("\n是否修改配置? (y/n，默认n): ").strip().lower()
     if choice == 'y':
         ConfigUI.edit_server_config(config_manager)
     
+    # 重新获取配置（可能已修改）
     server_port = config_manager.get("server.port", 2983)
     resource_dir = config_manager.get("server.resource_dir", "resource")
     max_file_size_mb = config_manager.get("server.max_file_size_mb", 1024)
@@ -131,8 +144,8 @@ def main():
         server_socket.bind(('0.0.0.0', server_port))
         server_socket.listen(100)
         logger.info('服务器已启动，监听端口 {0}'.format(server_port))
-        print('服务器已启动，监听端口 {0}'.format(server_port))
-        print('按 Ctrl+C 停止服务器')
+        print('服务器已启动，监听端口 {0}'.format(server_port), flush=True)
+        print('按 Ctrl+C 停止服务器', flush=True)
         
         server_handler = ServerHandler(resource_dir=resource_dir, max_file_size_mb=max_file_size_mb)
         frame_handler = FrameHandler()

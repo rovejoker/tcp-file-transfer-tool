@@ -57,9 +57,11 @@ TCP文件传输工具/
 ├── src/                      # 源代码目录
 │   ├── __init__.py
 │   ├── common/               # 公共模块
-│   │   ├── config_manager.py # 配置管理
-│   │   ├── config_ui.py      # 配置界面
-│   │   └── exceptions.py     # 自定义异常
+│   │   ├── config_manager.py     # 配置管理
+│   │   ├── config_ui.py          # 配置界面
+│   │   ├── connection_manager.py # 连接管理器（心跳检测、自动重连）
+│   │   ├── exceptions.py         # 自定义异常
+│   │   └── ui_utils.py           # UI工具（跨平台输入处理）
 │   ├── protocol/             # 协议模块
 │   │   ├── __init__.py
 │   │   └── xprotocol.py      # 协议定义
@@ -224,6 +226,11 @@ MIT License
 - v1.2.0 - 添加安全防护功能（连接数限制、路径穿越防护）
 - v1.3.0 - 优化上传速度，支持流式写入
 - v1.4.0 - 修复下载逻辑问题，优化日志输出
+- v1.5.0 - 重构客户端代码结构
+  - 新增 `connection_manager.py`：封装连接状态、心跳监控和自动重连
+  - 新增 `ui_utils.py`：封装跨平台用户输入处理
+  - 消除全局变量，提高代码可维护性和可测试性
+  - 修复日志中文乱码问题
 
 ## 开发说明
 
