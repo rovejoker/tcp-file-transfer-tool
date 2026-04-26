@@ -44,7 +44,7 @@ class FrameHandler:
             if not header_data or len(header_data) != HEADER_SIZE:
                 raise ValueError("无法接收完整头部数据")
             
-            version, frame_type, data_length = XProtocol.parse_header(header_data)
+            version, frame_type, data_length, expected_crc = XProtocol.parse_header(header_data)
             
             received_data = b''
             while len(received_data) < data_length:
@@ -55,6 +55,10 @@ class FrameHandler:
                 
                 if progress_callback and data_length > 0:
                     progress_callback(len(received_data), data_length)
+            
+            # 验证 CRC32 校验码
+            if not XProtocol.verify_crc(received_data, expected_crc):
+                raise ValueError("CRC 校验失败，数据可能已损坏")
             
             if frame_type == TYPE_JSON:
                 decoded_data = XProtocol.decode_json(received_data)

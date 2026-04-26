@@ -23,14 +23,19 @@ def configure_logging(level: int = logging.INFO):
         root_logger.setLevel(level)
         return
     
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('app.log', encoding='utf-8'),
-            logging.StreamHandler()
-        ]
-    )
+    # 文件处理器：记录所有 INFO 及以上级别日志
+    file_handler = logging.FileHandler('app.log', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    
+    # 控制台处理器：只显示 WARNING 及以上级别日志
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
 
 
 def get_logger(name: str) -> Logger:

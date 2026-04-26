@@ -1,45 +1,65 @@
 # -*- coding: utf-8 -*-
 """
-服务器业务处理器
+服务器业务处理器模块
 
 处理客户端请求，实现文件上传、下载和列表功能。
+根据文件大小自动选择传输方式：
+- 小文件（<=50MB）：一次性传输
+- 大文件（>50MB）：分块传输
+
+支持单IP连接数限制，防止DOS攻击。
 """
 
 import os
 import time
 from typing import Optional, Tuple
 
-from ..protocol import TYPE_JSON, TYPE_BINARY, TYPE_CHUNK, ACTION_UPLOAD, ACTION_DOWNLOAD, ACTION_LISTFILES, ACTION_HEARTBEAT, XProtocol
+from ..protocol import TYPE_JSON, TYPE_BINARY, TYPE_CHUNK
+from ..protocol import ACTION_UPLOAD, ACTION_DOWNLOAD, ACTION_LISTFILES, ACTION_HEARTBEAT
 from ..utils.logger import get_logger
-from ..utils.file_utils import save_file, load_file, list_files, ensure_directory, read_file_chunks, DEFAULT_CHUNK_SIZE, SMALL_FILE_THRESHOLD, is_filename_safe, calculate_file_hash, calculate_data_hash, sanitize_filename, is_path_within_directory
-from ..common.exceptions import ValidationError, SecurityError, HashMismatchError
+from ..utils.file_utils import (
+    save_file, load_file, list_files, ensure_directory, read_file_chunks,
+    DEFAULT_CHUNK_SIZE, SMALL_FILE_THRESHOLD, is_filename_safe,
+    calculate_file_hash, calculate_data_hash, sanitize_filename, is_path_within_directory
+)
 
 
 class ServerHandler:
     """
-    服务器业务处理器类
+    服务器业务处理器
     
     处理客户端的文件上传、下载和列表请求。
-    根据文件大小自动选择传输方式：
-    - 小文件（<=100MB）：一次性传输
-    - 大文件（>100MB）：分块传输
-    
-    支持单IP连接数限制，防止DOS攻击。
+    支持单IP连接数限制和文件完整性校验。
     """
     
     def __init__(self, resource_dir: str = "resource", max_file_size_mb: int = 1024, 
                  max_connections_per_ip: int = 5):
+        """
+        初始化服务器处理器
+        
+        Args:
+            resource_dir: 资源文件存储目录，默认为 "resource"
+            max_file_size_mb: 最大文件大小限制（MB），默认为 1024（1GB）
+            max_connections_per_ip: 单IP最大连接数，默认为 5
+        """
         self.resource_dir = resource_dir
         self.max_file_size_bytes = max_file_size_mb * 1024 * 1024
         self.chunk_size = DEFAULT_CHUNK_SIZE
         self.max_connections_per_ip = max_connections_per_ip
         self.logger = get_logger(__name__)
         self.upload_tracking = {}
-        self.chunk_buffer = {}
         self.connection_counts = {}
     
     def check_ip_connection_limit(self, client_address: Tuple[str, int]) -> bool:
-        """检查客户端IP是否超过连接数限制"""
+        """
+        检查客户端IP是否超过连接数限制
+        
+        Args:
+            client_address: 客户端地址元组 (IP, port)
+        
+        Returns:
+            bool: 是否允许连接
+        """
         if client_address is None:
             return True
         
@@ -47,14 +67,24 @@ class ServerHandler:
         return self.connection_counts.get(client_ip, 0) < self.max_connections_per_ip
     
     def increment_connection_count(self, client_address: Tuple[str, int]):
-        """增加客户端IP的连接计数"""
+        """
+        增加客户端IP的连接计数
+        
+        Args:
+            client_address: 客户端地址元组 (IP, port)
+        """
         if client_address is not None:
             client_ip = client_address[0]
             self.connection_counts[client_ip] = self.connection_counts.get(client_ip, 0) + 1
             self.logger.debug('IP {0} 连接数增加: {1}'.format(client_ip, self.connection_counts[client_ip]))
     
     def decrement_connection_count(self, client_address: Tuple[str, int]):
-        """减少客户端IP的连接计数"""
+        """
+        减少客户端IP的连接计数
+        
+        Args:
+            client_address: 客户端地址元组 (IP, port)
+        """
         if client_address is not None:
             client_ip = client_address[0]
             if client_ip in self.connection_counts:
@@ -63,7 +93,17 @@ class ServerHandler:
     
     def handle_request(self, frame_type: int, decoded_data: dict, 
                       client_address: Optional[Tuple[str, int]] = None):
-        """处理客户端请求"""
+        """
+        处理客户端请求（主入口）
+        
+        Args:
+            frame_type: 帧类型（TYPE_JSON, TYPE_BINARY, TYPE_CHUNK）
+            decoded_data: 解码后的数据
+            client_address: 客户端地址元组
+        
+        Returns:
+            dict/bytes/None: 响应数据
+        """
         try:
             if frame_type == TYPE_JSON:
                 return self._handle_json_command(decoded_data, client_address)
@@ -78,7 +118,16 @@ class ServerHandler:
             return {"status": "error", "message": str(e)}
     
     def _handle_json_command(self, json_data: dict, client_address):
-        """处理 JSON 指令"""
+        """
+        处理 JSON 指令
+        
+        Args:
+            json_data: JSON数据字典
+            client_address: 客户端地址元组
+        
+        Returns:
+            dict: 响应字典
+        """
         action = json_data.get("action")
         
         if action == ACTION_UPLOAD:
@@ -95,16 +144,30 @@ class ServerHandler:
             return {"status": "error", "message": "未知指令: {0}".format(action)}
     
     def _handle_heartbeat_request(self):
-        """处理心跳请求"""
+        """
+        处理心跳请求
+        
+        Returns:
+            dict: 心跳响应
+        """
         return {"status": "success", "action": ACTION_HEARTBEAT, "timestamp": int(time.time())}
     
     def _handle_upload_request(self, json_data: dict, client_address):
-        """处理上传请求"""
+        """
+        处理文件上传请求
+        
+        Args:
+            json_data: 上传请求数据
+            client_address: 客户端地址元组
+        
+        Returns:
+            dict: 上传响应
+        """
         filename = json_data.get("filename")
         file_size = json_data.get("size", 0)
         is_large = json_data.get("is_large", False)
         file_hash = json_data.get("hash", "")
-        resume_from = json_data.get("resume_from", 0)  # 断点续传起始位置
+        resume_from = json_data.get("resume_from", 0)
         
         if not filename:
             return {"status": "error", "message": "缺少文件名"}
@@ -133,6 +196,7 @@ class ServerHandler:
         if os.path.exists(file_path):
             current_size = os.path.getsize(file_path)
         
+        # 记录上传上下文
         if client_address:
             self.upload_tracking[client_address] = {
                 'filename': filename,
@@ -140,7 +204,7 @@ class ServerHandler:
                 'is_large': is_large,
                 'chunk_size': json_data.get("chunk_size", self.chunk_size),
                 'hash': file_hash,
-                'resume_from': max(resume_from, current_size),  # 取较大值作为实际起始位置
+                'resume_from': max(resume_from, current_size),
                 'current_size': current_size
             }
         
@@ -151,11 +215,20 @@ class ServerHandler:
             "filename": filename,
             "is_large": is_large,
             "chunk_size": self.chunk_size if is_large else 0,
-            "resume_from": current_size  # 返回已存在的文件大小，用于断点续传
+            "resume_from": current_size
         }
     
     def _handle_download_request(self, json_data: dict):
-        """处理下载请求（支持断点续传）"""
+        """
+        处理文件下载请求（支持断点续传）
+        
+        Args:
+            json_data: 下载请求数据
+        
+        Returns:
+            dict: 下载响应
+        """
+        self.logger.info('收到下载请求: {0}'.format(json_data))
         ensure_directory(self.resource_dir)
         
         filename = json_data.get("filename")
@@ -164,7 +237,7 @@ class ServerHandler:
         if not filename:
             return {"status": "error", "message": "缺少文件名"}
         
-        # 安全检查：强制提取纯文件名，防止路径穿越攻击
+        # 安全检查：强制提取纯文件名
         filename = sanitize_filename(filename)
         
         if not is_filename_safe(filename):
@@ -204,7 +277,12 @@ class ServerHandler:
         }
     
     def _handle_list_files_request(self):
-        """处理文件列表请求"""
+        """
+        处理文件列表请求
+        
+        Returns:
+            dict: 文件列表响应
+        """
         ensure_directory(self.resource_dir)
         files = list_files(self.resource_dir)
         
@@ -215,7 +293,16 @@ class ServerHandler:
         }
     
     def _handle_binary_data(self, binary_data: bytes, client_address):
-        """处理二进制数据（文件上传，一次性）"""
+        """
+        处理二进制数据（小文件一次性上传）
+        
+        Args:
+            binary_data: 文件二进制数据
+            client_address: 客户端地址元组
+        
+        Returns:
+            dict: 上传结果响应
+        """
         upload_info = self.upload_tracking.get(client_address)
         if not upload_info:
             return {"status": "error", "message": "未找到上传上下文"}
@@ -227,11 +314,12 @@ class ServerHandler:
             file_path = os.path.join(self.resource_dir, filename)
             save_file(file_path, binary_data)
             
+            # 校验文件完整性
             if expected_hash:
                 actual_hash = calculate_data_hash(binary_data)
                 if actual_hash != expected_hash:
                     os.remove(file_path)
-                    raise HashMismatchError("文件哈希校验失败")
+                    return {"status": "error", "message": "文件哈希校验失败"}
             
             self.logger.info('文件上传成功: {0}'.format(filename))
             return {"status": "success", "message": "文件上传成功"}
@@ -239,11 +327,21 @@ class ServerHandler:
             self.logger.error('文件上传失败: {0}'.format(e))
             return {"status": "error", "message": str(e)}
         finally:
+            # 清理上传上下文
             if client_address in self.upload_tracking:
                 del self.upload_tracking[client_address]
     
     def _handle_chunk_data(self, chunk_data: bytes, client_address):
-        """处理分块数据（文件上传，分块）- 流式写入"""
+        """
+        处理分块数据（大文件分块上传，流式写入）
+        
+        Args:
+            chunk_data: 文件块数据
+            client_address: 客户端地址元组
+        
+        Returns:
+            dict/None: 上传结果响应（完成时返回，中间分块返回None）
+        """
         upload_info = self.upload_tracking.get(client_address)
         if not upload_info:
             return {"status": "error", "message": "未找到上传上下文"}
@@ -273,45 +371,62 @@ class ServerHandler:
                         # 清理上传上下文
                         if client_address in self.upload_tracking:
                             del self.upload_tracking[client_address]
-                        if client_address in self.chunk_buffer:
-                            del self.chunk_buffer[client_address]
-                        raise HashMismatchError("文件哈希校验失败")
+                        return {"status": "error", "message": "文件哈希校验失败"}
                 
                 # 清理上传上下文（上传成功）
                 if client_address in self.upload_tracking:
                     del self.upload_tracking[client_address]
-                if client_address in self.chunk_buffer:
-                    del self.chunk_buffer[client_address]
                 
                 self.logger.info('文件上传成功: {0}'.format(filename))
                 return {"status": "success", "message": "文件上传成功"}
             else:
                 # 继续接收，不需要确认（提升上传速度）
                 return None
-        except HashMismatchError as e:
-            self.logger.error('文件哈希校验失败: {0}'.format(e))
-            return {"status": "error", "message": str(e)}
         except Exception as e:
             # 清理上传上下文（上传失败）
             if client_address in self.upload_tracking:
                 del self.upload_tracking[client_address]
-            if client_address in self.chunk_buffer:
-                del self.chunk_buffer[client_address]
             self.logger.error('文件上传失败: {0}'.format(e))
             return {"status": "error", "message": str(e)}
     
     def download_file_single(self, client_socket, frame_handler, filename: str):
-        """一次性发送文件"""
+        """
+        一次性发送文件（适用于小文件）
+        
+        Args:
+            client_socket: 客户端socket连接
+            frame_handler: 帧处理器
+            filename: 要发送的文件名
+        """
         try:
+            self.logger.info('开始发送文件: {0}'.format(filename))
             file_path = os.path.join(self.resource_dir, filename)
             file_data = load_file(file_path)
+            self.logger.info('文件加载完成，大小: {0} 字节'.format(len(file_data)))
             frame_handler.send_binary_frame(client_socket, file_data)
             self.logger.info('文件发送成功: {0}'.format(filename))
+            
+            # 等待客户端确认，设置较长超时时间（30秒）
+            frame_type, response = frame_handler.receive_frame(client_socket, timeout=30)
+            if response and response.get("status") == "success":
+                self.logger.info('客户端确认文件下载成功: {0}'.format(filename))
+            else:
+                self.logger.error('客户端报告下载失败: {0}'.format(response.get("message", "未知错误") if response else "无响应"))
+                
         except Exception as e:
             self.logger.error('文件发送失败: {0}'.format(e))
     
-    def download_file_chunked(self, client_socket, frame_handler, filename: str, resume_from: int = 0):
-        """分块发送文件（支持断点续传）"""
+    def download_file_chunked(self, client_socket, frame_handler, filename: str, 
+                              resume_from: int = 0):
+        """
+        分块发送文件（适用于大文件，支持断点续传）
+        
+        Args:
+            client_socket: 客户端socket连接
+            frame_handler: 帧处理器
+            filename: 要发送的文件名
+            resume_from: 断点续传起始位置（字节）
+        """
         try:
             file_path = os.path.join(self.resource_dir, filename)
             for chunk in read_file_chunks(file_path, self.chunk_size, resume_from):
